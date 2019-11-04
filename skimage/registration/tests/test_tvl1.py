@@ -2,7 +2,7 @@ import numpy as np
 from skimage._shared import testing
 from skimage.registration import optical_flow_tvl1
 from skimage.transform import warp
-
+import cupy as cp
 
 def _sin_flow_gen(image0, max_motion=4.5, npics=5):
     """Generate a synthetic ground truth optical flow with a sinusoid as
@@ -37,7 +37,7 @@ def test_2d_motion():
     image0 = rnd.normal(size=(256, 256))
     gt_flow, image1 = _sin_flow_gen(image0)
     # Estimate the flow
-    flow = optical_flow_tvl1(image0, image1, attachment=5)
+    flow = cp.asnumpy(optical_flow_tvl1(image0, image1, attachment=5))
     # Assert that the average absolute error is less then half a pixel
     assert abs(flow - gt_flow) .mean() < 0.5
 
@@ -48,7 +48,7 @@ def test_3d_motion():
     image0 = rnd.normal(size=(128, 128, 128))
     gt_flow, image1 = _sin_flow_gen(image0)
     # Estimate the flow
-    flow = optical_flow_tvl1(image0, image1, attachment=5)
+    flow = cp.asnumpy(optical_flow_tvl1(image0, image1, attachment=5))
     # Assert that the average absolute error is less then half a pixel
     assert abs(flow - gt_flow) .mean() < 0.5
 
@@ -57,7 +57,7 @@ def test_no_motion_2d():
     rnd = np.random.RandomState(0)
     img = rnd.normal(size=(256, 256))
 
-    flow = optical_flow_tvl1(img, img)
+    flow = cp.asnumpy(optical_flow_tvl1(img, img))
 
     assert np.all(flow == 0)
 
@@ -66,7 +66,7 @@ def test_no_motion_3d():
     rnd = np.random.RandomState(0)
     img = rnd.normal(size=(128, 128, 128))
 
-    flow = optical_flow_tvl1(img, img)
+    flow = cp.asnumpy(optical_flow_tvl1(img, img))
 
     assert np.all(flow == 0)
 

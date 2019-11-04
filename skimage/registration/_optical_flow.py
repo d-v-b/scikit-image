@@ -5,10 +5,96 @@
 
 from functools import partial
 import numpy as np
-from scipy import ndimage as ndi
-from skimage.transform import warp
+import cupy as cp
+import cupyx.scipy.ndimage as ndi
+
+#from scipy import ndimage as ndi
+#from skimage.transform import warp
 
 from ._optical_flow_utils import coarse_to_fine
+
+
+def gradient(f, **kwargs):
+    import numpy.core.numeric as _nx
+    f = cp.asanyarray(f)
+    N = f.ndim  # number of dimensions
+
+    axes = kwargs.pop('axis', None)
+    if axes is None:
+        axes = tuple(range(N))
+    else:
+        axes = _nx.normalize_axis_tuple(axes, N)
+
+    len_axes = len(axes)
+
+    dx = [1.0] * len_axes
+    edge_order = kwargs.pop('edge_order', 1)
+    if kwargs:
+        raise TypeError('"{}" are not valid keyword arguments.'.format(
+            '", "'.join(kwargs.keys())))
+    if edge_order > 2:
+        raise ValueError("'edge_order' greater than 2 not supported")
+
+    # use central differences on interior and one-sided differences on the
+    # endpoints. This preserves second order-accuracy over the full domain.
+
+    outvals = []
+
+    # create slice objects --- initially all are [:, :, ..., :]
+    slice1 = [slice(None)] * N
+    slice2 = [slice(None)] * N
+    slice3 = [slice(None)] * N
+    slice4 = [slice(None)] * N
+
+    otype = np.double
+
+    for axis, ax_dx in zip(axes, dx):
+        if f.shape[axis] < edge_order + 1:
+            raise ValueError(
+                "Shape of array too small to calculate a numerical gradient, "
+                "at least (edge_order + 1) elements are required.")
+        # result allocation
+        out = cp.empty_like(f, dtype=otype)
+
+        # spacing for the current axis
+        uniform_spacing = np.ndim(ax_dx) == 0
+
+        # Numerical differentiation: 2nd order interior
+        slice1[axis] = slice(1, -1)
+        slice2[axis] = slice(None, -2)
+        slice3[axis] = slice(1, -1)
+        slice4[axis] = slice(2, None)
+
+        out[tuple(slice1)] = (f[tuple(slice4)] - f[tuple(slice2)]) / (2. * ax_dx)
+
+        # Numerical differentiation: 1st order edges
+
+        slice1[axis] = 0
+        slice2[axis] = 1
+        slice3[axis] = 0
+        dx_0 = ax_dx
+        # 1D equivalent -- out[0] = (f[1] - f[0]) / (x[1] - x[0])
+        out[tuple(slice1)] = (f[tuple(slice2)] - f[tuple(slice3)]) / dx_0
+
+        slice1[axis] = -1
+        slice2[axis] = -1
+        slice3[axis] = -2
+        dx_n = ax_dx
+        # 1D equivalent -- out[-1] = (f[-1] - f[-2]) / (x[-1] - x[-2])
+        out[tuple(slice1)] = (f[tuple(slice2)] - f[tuple(slice3)]) / dx_n
+
+        outvals.append(out)
+
+        # reset the slice object in this dimension to ":"
+        slice1[axis] = slice(None)
+        slice2[axis] = slice(None)
+        slice3[axis] = slice(None)
+        slice4[axis] = slice(None)
+
+    if len_axes == 1:
+        return outvals[0]
+    else:
+        return outvals
 
 
 def _tvl1(reference_image, moving_image, flow0, attachment, tightness,
@@ -47,11 +133,13 @@ def _tvl1(reference_image, moving_image, flow0, attachment, tightness,
         The estimated optical flow components for each axis.
 
     """
-
+    reference_image = cp.asarray(reference_image)
+    moving_image = cp.asarray(moving_image)
+    flow0 = cp.asarray(flow0)
     dtype = reference_image.dtype
-    grid = np.meshgrid(*[np.arange(n, dtype=dtype)
+    grid = cp.stack(cp.meshgrid(*[cp.arange(n, dtype=dtype)
                          for n in reference_image.shape],
-                       indexing='ij')
+                       indexing='ij'))
 
     dt = 0.5 / reference_image.ndim
     reg_num_iter = 2
@@ -61,8 +149,8 @@ def _tvl1(reference_image, moving_image, flow0, attachment, tightness,
 
     flow_current = flow_previous = flow0
 
-    g = np.zeros((reference_image.ndim,) + reference_image.shape, dtype=dtype)
-    proj = np.zeros((reference_image.ndim, reference_image.ndim,)
+    g = cp.zeros((reference_image.ndim,) + reference_image.shape, dtype=dtype)
+    proj = cp.zeros((reference_image.ndim, reference_image.ndim,)
                     + reference_image.shape, dtype=dtype)
 
     s_g = [slice(None), ] * g.ndim
@@ -70,12 +158,9 @@ def _tvl1(reference_image, moving_image, flow0, attachment, tightness,
     s_d = [slice(None), ] * (proj.ndim-2)
 
     for _ in range(num_warp):
-        if prefilter:
-            flow_current = ndi.median_filter(flow_current,
-                                             [1] + reference_image.ndim * [3])
-
-        image1_warp = warp(moving_image, grid + flow_current, mode='nearest')
-        grad = np.array(np.gradient(image1_warp))
+        coords = (grid + flow_current).reshape((2,-1))
+        image1_warp = ndi.map_coordinates(moving_image, coords, mode='nearest').reshape(moving_image.shape)
+        grad = cp.stack(gradient(image1_warp))
         NI = (grad*grad).sum(0)
         NI[NI == 0] = 1
 
@@ -94,7 +179,7 @@ def _tvl1(reference_image, moving_image, flow0, attachment, tightness,
             flow_auxiliary[:, idx] -= rho[idx]*grad[:, idx]/NI[idx]
 
             idx = ~idx
-            srho = f0 * np.sign(rho[idx])
+            srho = f0 * cp.sign(rho[idx])
             flow_auxiliary[:, idx] -= srho*grad[:, idx]
 
             # Regularization term
@@ -106,10 +191,10 @@ def _tvl1(reference_image, moving_image, flow0, attachment, tightness,
                     for ax in range(reference_image.ndim):
                         s_g[0] = ax
                         s_g[ax+1] = slice(0, -1)
-                        g[tuple(s_g)] = np.diff(flow_current[idx], axis=ax)
+                        g[tuple(s_g)] = cp.diff(flow_current[idx], axis=ax)
                         s_g[ax+1] = slice(None)
 
-                    norm = np.sqrt((g ** 2).sum(0))[np.newaxis, ...]
+                    norm = cp.sqrt((g ** 2).sum(0))[cp.newaxis, ...]
                     norm *= f1
                     norm += 1.
                     proj[idx] -= dt * g
